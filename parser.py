@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
-WB Position Parser.
+WB Position Parser (browser-based).
 
-Для каждой строки в Google-таблице "ПРОГРЕВЫ":
-  1. Извлекает артикул конкурента из ссылки (колонка G).
-  2. Запрашивает у API Wildberries список "Смотрите также" для этой карточки.
-  3. Ищет наш артикул (колонка B строки 2 листа) в первых 100 позициях.
-  4. Пишет результат в колонку I и таймстамп в колонку H.
-
-Запускается из GitHub Actions по расписанию или вручную.
-Креды Service Account берутся из переменной окружения GOOGLE_CREDENTIALS.
+Открывает карточки конкурентов из Google-таблицы "ПРОГРЕВЫ" в headless Chromium,
+находит блок "Смотрите также" и ищет в нём ваш артикул.
+Пишет результат в колонку I, таймстамп в колонку H.
 """
 
 from __future__ import annotations
@@ -25,31 +20,33 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import gspread
-import requests
 from google.oauth2.service_account import Credentials
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    TimeoutError as PWTimeout,
+    sync_playwright,
+)
 
-# ---------- Конфиг ----------
 SHEET_ID = os.environ.get(
     "SHEET_ID",
     "1m_anO1SgQaSTUVEcresy-_IWSCfBZDjnsFwnr6kT20w",
 )
 
-# Адаптивный темп: целимся в 90 минут (5400 с), но парсим до конца если не успеваем.
 PLAN_WINDOW_SECONDS = 90 * 60
-MIN_INTERVAL_SECONDS = 2.0
+MIN_INTERVAL_SECONDS = 12.0
 SEARCH_DEPTH = 100
+MAX_ITEMS_TO_COLLECT = 120
 
 TIMEZONE = ZoneInfo("Europe/Moscow")
-REQUEST_TIMEOUT = 15
-RETRY_COUNT = 1  # один повтор при сетевой ошибке
+NAV_TIMEOUT_MS = 35000
+DOM_TIMEOUT_MS = 20000
 
-# Колонки (1-indexed)
-COL_OUR_ARTICLE = "B"  # наш артикул, берём из B2
-COL_COMPETITOR_URL = "G"  # ссылка на карточку конкурента
-COL_TIMESTAMP = "H"  # дата проверки
-COL_POSITION = "I"  # место / результат
-
-START_ROW = 2
+COL_OUR_ARTICLE = "B"
+COL_COMPETITOR_URL = "G"
+COL_TIMESTAMP = "H"
+COL_POSITION = "I"
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -67,7 +64,6 @@ logging.basicConfig(
 logger = logging.getLogger("wb-parser")
 
 
-# ---------- Google Sheets ----------
 def get_google_client() -> gspread.Client:
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -81,13 +77,176 @@ def get_google_client() -> gspread.Client:
         creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
     else:
         raise RuntimeError(
-            "Не найдены креды: задайте переменную окружения GOOGLE_CREDENTIALS "
-            "или положите credentials.json рядом со скриптом."
+            "Не найдены креды: задайте GOOGLE_CREDENTIALS или положите credentials.json рядом."
         )
     return gspread.authorize(creds)
 
 
-# ---------- WB API ----------
+SIMILAR_EXTRACTION_JS = r"""
+() => {
+    const RE_SIMILAR = /смотрите\s+также/i;
+    const RE_CATALOG = /\/catalog\/(\d+)\//;
+    const HEADER_SEL = 'h1, h2, h3, h4, h5, [class*="goods-name"], '
+        + '[class*="section-name"], [class*="section__title"], [class*="title"], '
+        + '[class*="Title"], [class*="header"]';
+
+    function findHeader() {
+        const candidates = document.querySelectorAll(HEADER_SEL);
+        for (const el of candidates) {
+            const text = (el.textContent || '').trim();
+            if (text.length > 60) continue;
+            if (RE_SIMILAR.test(text)) return el;
+        }
+        return null;
+    }
+
+    function containerOf(el) {
+        let node = el;
+        for (let i = 0; i < 6 && node.parentElement; i++) {
+            node = node.parentElement;
+            const links = node.querySelectorAll('a[href*="/catalog/"]');
+            if (links.length >= 4) return node;
+        }
+        return node;
+    }
+
+    function collectIds(root) {
+        const links = root.querySelectorAll('a[href*="/catalog/"]');
+        const ids = [];
+        const seen = new Set();
+        for (const a of links) {
+            const href = a.getAttribute('href') || '';
+            const m = href.match(RE_CATALOG);
+            if (!m) continue;
+            const id = parseInt(m[1], 10);
+            if (!id || seen.has(id)) continue;
+            seen.add(id);
+            ids.push(id);
+        }
+        return ids;
+    }
+
+    const header = findHeader();
+    if (!header) return { found: false, ids: [] };
+    const cont = containerOf(header);
+    return { found: true, ids: collectIds(cont) };
+}
+"""
+
+
+def ensure_consent(page: Page) -> None:
+    try:
+        page.evaluate(
+            """
+            () => {
+                const btns = [...document.querySelectorAll('button, a')];
+                for (const b of btns) {
+                    const t = (b.textContent || '').trim().toLowerCase();
+                    if (t === 'принять' || t === 'ок' || t === 'хорошо' ||
+                        t.includes('подтвердить') || t.includes('accept')) {
+                        b.click();
+                    }
+                }
+            }
+            """
+        )
+    except Exception:
+        pass
+
+
+def fetch_similar_nm_ids(page: Page, url: str) -> tuple[list[int] | None, str | None]:
+    try:
+        resp = page.goto(url, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+    except PWTimeout:
+        return None, "timeout"
+    except Exception as e:
+        return None, f"error:{type(e).__name__}"
+
+    if resp is not None and resp.status in (404, 410):
+        return None, "404"
+    if resp is not None and resp.status >= 500:
+        return None, f"error:HTTP{resp.status}"
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=8000)
+    except PWTimeout:
+        pass
+
+    ensure_consent(page)
+
+    header_visible = False
+    last_h = 0
+    for _ in range(25):
+        try:
+            found = page.evaluate(
+                """
+                () => {
+                    const RE = /смотрите\\s+также/i;
+                    const sel = 'h1, h2, h3, h4, h5, [class*="goods-name"], [class*="section-name"], [class*="section__title"], [class*="title"], [class*="Title"], [class*="header"]';
+                    for (const el of document.querySelectorAll(sel)) {
+                        const t = (el.textContent || '').trim();
+                        if (t.length > 60) continue;
+                        if (RE.test(t)) {
+                            el.scrollIntoView({block: 'center', behavior: 'instant'});
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                """
+            )
+            if found:
+                header_visible = True
+                break
+        except Exception:
+            pass
+        page.mouse.wheel(0, 1500)
+        page.wait_for_timeout(500)
+        cur_h = page.evaluate("document.body.scrollHeight")
+        if cur_h == last_h:
+            page.wait_for_timeout(500)
+        last_h = cur_h
+
+    if not header_visible:
+        title = ""
+        try:
+            title = page.title() or ""
+        except Exception:
+            pass
+        if "не найден" in title.lower() or "404" in title:
+            return None, "404"
+        return None, "no_block"
+
+    prev_count = -1
+    stable = 0
+    ids: list[int] = []
+    for _ in range(40):
+        try:
+            data = page.evaluate(SIMILAR_EXTRACTION_JS)
+        except Exception:
+            data = {"found": True, "ids": []}
+        ids = data.get("ids", []) if isinstance(data, dict) else []
+        if len(ids) >= MAX_ITEMS_TO_COLLECT:
+            return ids[:MAX_ITEMS_TO_COLLECT], None
+        if len(ids) == prev_count:
+            stable += 1
+            if stable >= 4:
+                break
+        else:
+            stable = 0
+        prev_count = len(ids)
+        page.mouse.wheel(0, 900)
+        page.wait_for_timeout(550)
+
+    if not ids:
+        return None, "no_block"
+    return ids, None
+
+
+def now_msk_str() -> str:
+    return datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
+
+
 def extract_nm_id(url: str) -> int | None:
     if not url:
         return None
@@ -101,104 +260,6 @@ def extract_nm_id(url: str) -> int | None:
     if m:
         return int(m.group(1))
     return None
-
-
-def _parse_nm_ids(data) -> list[int] | None:
-    if isinstance(data, dict):
-        for key in ("nmIds", "nms", "ids"):
-            if key in data and isinstance(data[key], list):
-                return [int(x) for x in data[key] if x]
-        inner = data.get("data")
-        if isinstance(inner, dict):
-            for key in ("nmIds", "nms", "products"):
-                if key in inner and isinstance(inner[key], list):
-                    items = inner[key]
-                    if items and isinstance(items[0], dict):
-                        return [
-                            int(p.get("id") or p.get("nmId") or 0)
-                            for p in items
-                            if (p.get("id") or p.get("nmId"))
-                        ]
-                    return [int(x) for x in items if x]
-    elif isinstance(data, list):
-        if not data:
-            return []
-        if isinstance(data[0], dict):
-            return [
-                int(p.get("id") or p.get("nmId") or 0)
-                for p in data
-                if (p.get("id") or p.get("nmId"))
-            ]
-        return [int(x) for x in data if x]
-    return None
-
-
-def fetch_similar_nm_ids(nm_id: int, session: requests.Session) -> list[int] | None:
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Origin": "https://www.wildberries.ru",
-        "Referer": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
-    }
-    endpoints = [
-        f"https://similar-goods.wildberries.ru/api/v3/similar?nm={nm_id}",
-        f"https://similar-goods.wildberries.ru/api/v2/search/similar?nm={nm_id}",
-    ]
-    last_error: str | None = None
-    got_404 = False
-    for url in endpoints:
-        try:
-            resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        except requests.RequestException as e:
-            last_error = f"{type(e).__name__}: {e}"
-            continue
-        if resp.status_code == 404:
-            got_404 = True
-            continue
-        if resp.status_code >= 400:
-            last_error = f"HTTP {resp.status_code} от {url}"
-            continue
-        try:
-            data = resp.json()
-        except ValueError as e:
-            last_error = f"Невалидный JSON от {url}: {e}"
-            continue
-        ids = _parse_nm_ids(data)
-        if ids is not None:
-            return ids
-        last_error = f"Не удалось найти nm_id в ответе {url}"
-    if got_404 and last_error is None:
-        return None
-    raise RuntimeError(last_error or "Неизвестная ошибка API WB")
-
-
-def verify_card_exists(nm_id: int, session: requests.Session) -> bool:
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/json, text/plain, */*",
-    }
-    urls = [
-        f"https://card.wb.ru/cards/v2/detail?appType=1&curr=rub&dest=-1257786&nm={nm_id}",
-        f"https://card.wb.ru/cards/v1/detail?appType=1&curr=rub&dest=-1257786&nm={nm_id}",
-    ]
-    for url in urls:
-        try:
-            r = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-            if r.status_code >= 400:
-                continue
-            data = r.json()
-            products = (data.get("data") or {}).get("products") or []
-            if products:
-                return True
-        except Exception:
-            continue
-    return False
-
-
-# ---------- Основной пайплайн ----------
-def now_msk_str() -> str:
-    return datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
 
 
 def collect_tasks(spreadsheet: gspread.Spreadsheet) -> list[dict]:
@@ -237,35 +298,22 @@ def collect_tasks(spreadsheet: gspread.Spreadsheet) -> list[dict]:
     return tasks
 
 
-def process_task(task: dict, session: requests.Session) -> tuple[str, str]:
+def process_task(page: Page, task: dict) -> tuple[str, str]:
     ts = now_msk_str()
-    nm_id = extract_nm_id(task["competitor_url"])
-    if not nm_id:
-        logger.warning(f"Не извлёк nm_id из URL: {task['competitor_url']}")
+    if not extract_nm_id(task["competitor_url"]):
+        logger.warning(f"Некорректный URL: {task['competitor_url']}")
         return "ошибка", ts
 
-    last_exc: Exception | None = None
-    ids: list[int] | None = None
-    got_none = False
-    for attempt in range(RETRY_COUNT + 1):
-        try:
-            ids = fetch_similar_nm_ids(nm_id, session)
-            if ids is None:
-                got_none = True
-            break
-        except Exception as e:
-            last_exc = e
-            if attempt < RETRY_COUNT:
-                time.sleep(2)
-            continue
-
-    if got_none or (ids is None and last_exc is None):
-        if not verify_card_exists(nm_id, session):
-            return "Конкурент не найден", now_msk_str()
-        return "ошибка", now_msk_str()
+    ids, reason = fetch_similar_nm_ids(page, task["competitor_url"])
+    if ids is None and reason and (reason == "timeout" or reason.startswith("error:")):
+        logger.info(f"Повтор для {task['competitor_url']} (причина: {reason})")
+        time.sleep(3)
+        ids, reason = fetch_similar_nm_ids(page, task["competitor_url"])
 
     if ids is None:
-        logger.warning(f"Ошибка API WB для nm={nm_id}: {last_exc}")
+        if reason == "404":
+            return "Конкурент не найден", now_msk_str()
+        logger.warning(f"Не получил блок для {task['competitor_url']}: {reason}")
         return "ошибка", now_msk_str()
 
     our_id = int(task["our_article"])
@@ -289,12 +337,33 @@ def flush_updates(
             ws.batch_update(ups, value_input_option="USER_ENTERED")
             logger.info(f"Лист {sheet_title}: записано {len(ups)} обновлений")
         except Exception as e:
-            logger.error(f"Ошибка записи в лист {sheet_title}: {e}")
+            logger.error(f"Ошибка записи в {sheet_title}: {e}")
     updates_by_sheet.clear()
 
 
+def build_context(browser: Browser) -> BrowserContext:
+    ua = random.choice(USER_AGENTS)
+    ctx = browser.new_context(
+        user_agent=ua,
+        locale="ru-RU",
+        timezone_id="Europe/Moscow",
+        viewport={"width": 1440, "height": 900},
+        extra_http_headers={
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
+    )
+    ctx.set_default_timeout(DOM_TIMEOUT_MS)
+    ctx.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+    def _route(route):
+        if route.request.resource_type in {"image", "media", "font"}:
+            return route.abort()
+        return route.continue_()
+    ctx.route("**/*", _route)
+    return ctx
+
+
 def main() -> int:
-    logger.info("=== WB Position Parser запущен ===")
+    logger.info("=== WB Position Parser (browser) запущен ===")
     gc = get_google_client()
     spreadsheet = gc.open_by_key(SHEET_ID)
     logger.info(f"Открыта таблица: {spreadsheet.title}")
@@ -307,46 +376,72 @@ def main() -> int:
         return 0
 
     interval = max(MIN_INTERVAL_SECONDS, PLAN_WINDOW_SECONDS / total)
-    estimated_min = (interval * total) / 60
+    est_min = (interval * total) / 60
     logger.info(
-        f"Интервал между запросами: {interval:.1f} с "
-        f"(ожидаемая длительность ≈ {estimated_min:.0f} мин)"
+        f"Интервал между карточками: {interval:.1f} с "
+        f"(ожидаемая длительность ≈ {est_min:.0f} мин)"
     )
-    if estimated_min > 90:
-        logger.warning(
-            f"Прогнозируемое время ({estimated_min:.0f} мин) превышает целевое окно 90 мин. "
-            "Парсер продолжит работу до конца."
-        )
 
-    session = requests.Session()
-    updates_by_sheet: dict[str, list[dict]] = {}
     started_all = time.monotonic()
+    updates_by_sheet: dict[str, list[dict]] = {}
 
-    for i, task in enumerate(tasks, start=1):
-        iter_started = time.monotonic()
-        position_text, ts = process_task(task, session)
-        logger.info(
-            f"[{i}/{total}] {task['sheet_title']}!{task['row']} "
-            f"→ позиция: {position_text}"
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
         )
-        updates_by_sheet.setdefault(task["sheet_title"], []).append(
-            {
-                "range": f"{COL_TIMESTAMP}{task['row']}:{COL_POSITION}{task['row']}",
-                "values": [[ts, position_text]],
-            }
-        )
-        if i % 20 == 0 or i == total:
-            flush_updates(spreadsheet, updates_by_sheet)
+        ctx = build_context(browser)
+        page = ctx.new_page()
 
-        if i < total:
-            elapsed = time.monotonic() - iter_started
-            sleep_for = max(0.0, interval - elapsed)
-            jitter = sleep_for * random.uniform(-0.1, 0.1)
-            sleep_for = max(0.5, sleep_for + jitter)
-            time.sleep(sleep_for)
+        for i, task in enumerate(tasks, start=1):
+            iter_started = time.monotonic()
+            try:
+                position_text, ts = process_task(page, task)
+            except Exception as e:
+                logger.error(
+                    f"Непредвиденная ошибка на {task['sheet_title']}!{task['row']}: {e}"
+                )
+                position_text, ts = "ошибка", now_msk_str()
+                try:
+                    page.close()
+                    ctx.close()
+                except Exception:
+                    pass
+                ctx = build_context(browser)
+                page = ctx.new_page()
+
+            logger.info(
+                f"[{i}/{total}] {task['sheet_title']}!{task['row']} → {position_text}"
+            )
+            updates_by_sheet.setdefault(task["sheet_title"], []).append(
+                {
+                    "range": f"{COL_TIMESTAMP}{task['row']}:{COL_POSITION}{task['row']}",
+                    "values": [[ts, position_text]],
+                }
+            )
+            if i % 10 == 0 or i == total:
+                flush_updates(spreadsheet, updates_by_sheet)
+
+            if i < total:
+                elapsed = time.monotonic() - iter_started
+                sleep_for = max(0.0, interval - elapsed)
+                jitter = sleep_for * random.uniform(-0.1, 0.1)
+                sleep_for = max(0.3, sleep_for + jitter)
+                time.sleep(sleep_for)
+
+        try:
+            page.close()
+            ctx.close()
+            browser.close()
+        except Exception:
+            pass
 
     total_min = (time.monotonic() - started_all) / 60
-    logger.info(f"=== Готово. Всего обработано {total} строк за {total_min:.1f} мин ===")
+    logger.info(f"=== Готово. Обработано {total} строк за {total_min:.1f} мин ===")
     return 0
 
 
