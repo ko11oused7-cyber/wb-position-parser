@@ -2,15 +2,14 @@ name: WB Position Parser
 
 on:
   schedule:
-    # 04:00 UTC = 07:00 MSK (UTC+3).
-    # Внимание: GitHub Actions может запускать расписание с задержкой 5–15 мин.
+    # 04:00 UTC = 07:00 MSK. GitHub может стартовать крон с задержкой 5–15 мин.
     - cron: '0 4 * * *'
-  workflow_dispatch: {}  # запуск вручную из вкладки Actions
+  workflow_dispatch: {}
 
 jobs:
   parse:
     runs-on: ubuntu-latest
-    timeout-minutes: 355  # лимит GitHub — 6 часов, берём с запасом
+    timeout-minutes: 355
     concurrency:
       group: wb-position-parser
       cancel-in-progress: false
@@ -24,10 +23,14 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Install Chromium for Playwright
+        run: |
+          python -m playwright install --with-deps chromium
 
       - name: Run parser
         env:
