@@ -1,0 +1,37 @@
+name: WB Position Parser
+
+on:
+  schedule:
+    # 04:00 UTC = 07:00 MSK (UTC+3).
+    # Внимание: GitHub Actions может запускать расписание с задержкой 5–15 мин.
+    - cron: '0 4 * * *'
+  workflow_dispatch: {}  # запуск вручную из вкладки Actions
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355  # лимит GitHub — 6 часов, берём с запасом
+    concurrency:
+      group: wb-position-parser
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run parser
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SHEET_ID: ${{ vars.SHEET_ID }}
+          TZ: Europe/Moscow
+        run: python parser.py
