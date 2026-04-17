@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pathlib
 import random
 import re
 import sys
@@ -42,6 +43,9 @@ MAX_ITEMS_TO_COLLECT = 120
 TIMEZONE = ZoneInfo("Europe/Moscow")
 NAV_TIMEOUT_MS = 35000
 DOM_TIMEOUT_MS = 20000
+
+FAILURE_DIR = pathlib.Path("failures")
+MAX_FAILURE_DUMPS = 10
 
 COL_OUR_ARTICLE = "B"
 COL_COMPETITOR_URL = "G"
@@ -84,18 +88,16 @@ def get_google_client() -> gspread.Client:
 
 SIMILAR_EXTRACTION_JS = r"""
 () => {
-    const RE_SIMILAR = /смотрите\s+также/i;
+    const RE_SIMILAR = /смотрите\s+также|похожие\s+товары|с\s+этим\s+(?:товаром|смотрят)|похожие|рекоменд|вместе\s+с\s+этим/i;
     const RE_CATALOG = /\/catalog\/(\d+)\//;
-    const HEADER_SEL = 'h1, h2, h3, h4, h5, [class*="goods-name"], '
-        + '[class*="section-name"], [class*="section__title"], [class*="title"], '
-        + '[class*="Title"], [class*="header"]';
 
     function findHeader() {
-        const candidates = document.querySelectorAll(HEADER_SEL);
+        const candidates = document.querySelectorAll('h1, h2, h3, h4, h5, h6, div, span, p');
         for (const el of candidates) {
-            const text = (el.textContent || '').trim();
-            if (text.length > 60) continue;
-            if (RE_SIMILAR.test(text)) return el;
+            if (el.children.length > 3) continue;
+            const t = (el.textContent || '').trim();
+            if (t.length < 5 || t.length > 60) continue;
+            if (RE_SIMILAR.test(t)) return el;
         }
         return null;
     }
@@ -154,7 +156,31 @@ def ensure_consent(page: Page) -> None:
         pass
 
 
-def fetch_similar_nm_ids(page: Page, url: str) -> tuple[list[int] | None, str | None]:
+_failure_dumps_saved = 0
+
+
+def save_failure_artifact(page: Page, nm_id: int | None, reason: str) -> None:
+    global _failure_dumps_saved
+    if _failure_dumps_saved >= MAX_FAILURE_DUMPS:
+        return
+    try:
+        FAILURE_DIR.mkdir(exist_ok=True)
+        tag = f"{nm_id or 'unknown'}_{reason}"
+        page.screenshot(path=str(FAILURE_DIR / f"{tag}.png"), full_page=True)
+        try:
+            html = page.content()
+            (FAILURE_DIR / f"{tag}.html").write_text(html[:600_000], encoding="utf-8")
+        except Exception:
+            pass
+        _failure_dumps_saved += 1
+        logger.info(f"Сохранён артефакт: failures/{tag}.png")
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить скриншот: {e}")
+
+
+def fetch_similar_nm_ids(
+    page: Page, url: str, nm_id: int | None = None
+) -> tuple[list[int] | None, str | None]:
     try:
         resp = page.goto(url, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
     except PWTimeout:
@@ -172,39 +198,52 @@ def fetch_similar_nm_ids(page: Page, url: str) -> tuple[list[int] | None, str | 
     except PWTimeout:
         pass
 
+    try:
+        title = (page.title() or "").strip()
+        final_url = page.url
+        logger.info(f"  → страница: {final_url} | title: {title!r}")
+        low = title.lower()
+        if "не найден" in low or "404" in low or "not found" in low:
+            return None, "404"
+    except Exception:
+        pass
+
     ensure_consent(page)
 
     header_visible = False
     last_h = 0
-    for _ in range(25):
+    for _ in range(30):
         try:
             found = page.evaluate(
                 """
                 () => {
-                    const RE = /смотрите\\s+также/i;
-                    const sel = 'h1, h2, h3, h4, h5, [class*="goods-name"], [class*="section-name"], [class*="section__title"], [class*="title"], [class*="Title"], [class*="header"]';
-                    for (const el of document.querySelectorAll(sel)) {
+                    const RE = /смотрите\\s+также|похожие\\s+товары|с\\s+этим\\s+(?:товаром|смотрят)|похожие|рекоменд|вместе\\s+с\\s+этим/i;
+                    const all = document.querySelectorAll('h1, h2, h3, h4, h5, h6, div, span, p');
+                    for (const el of all) {
+                        if (el.children.length > 3) continue;
                         const t = (el.textContent || '').trim();
-                        if (t.length > 60) continue;
+                        if (t.length < 5 || t.length > 60) continue;
                         if (RE.test(t)) {
                             el.scrollIntoView({block: 'center', behavior: 'instant'});
-                            return true;
+                            return t;
                         }
                     }
-                    return false;
+                    return null;
                 }
                 """
             )
             if found:
                 header_visible = True
+                logger.info(f"  → найден заголовок блока: {found!r}")
                 break
         except Exception:
             pass
         page.mouse.wheel(0, 1500)
-        page.wait_for_timeout(500)
-        cur_h = page.evaluate("document.body.scrollHeight")
-        if cur_h == last_h:
-            page.wait_for_timeout(500)
+        page.wait_for_timeout(600)
+        try:
+            cur_h = page.evaluate("document.body.scrollHeight")
+        except Exception:
+            cur_h = last_h
         last_h = cur_h
 
     if not header_visible:
@@ -214,7 +253,16 @@ def fetch_similar_nm_ids(page: Page, url: str) -> tuple[list[int] | None, str | 
         except Exception:
             pass
         if "не найден" in title.lower() or "404" in title:
+            save_failure_artifact(page, nm_id, "404")
             return None, "404"
+        try:
+            cnt = page.evaluate(
+                "document.querySelectorAll('a[href*=\"/catalog/\"]').length"
+            )
+            logger.info(f"  → блок не найден; всего ссылок /catalog/: {cnt}")
+        except Exception:
+            pass
+        save_failure_artifact(page, nm_id, "no_block")
         return None, "no_block"
 
     prev_count = -1
@@ -300,15 +348,16 @@ def collect_tasks(spreadsheet: gspread.Spreadsheet) -> list[dict]:
 
 def process_task(page: Page, task: dict) -> tuple[str, str]:
     ts = now_msk_str()
-    if not extract_nm_id(task["competitor_url"]):
+    nm_id = extract_nm_id(task["competitor_url"])
+    if not nm_id:
         logger.warning(f"Некорректный URL: {task['competitor_url']}")
         return "ошибка", ts
 
-    ids, reason = fetch_similar_nm_ids(page, task["competitor_url"])
+    ids, reason = fetch_similar_nm_ids(page, task["competitor_url"], nm_id)
     if ids is None and reason and (reason == "timeout" or reason.startswith("error:")):
         logger.info(f"Повтор для {task['competitor_url']} (причина: {reason})")
         time.sleep(3)
-        ids, reason = fetch_similar_nm_ids(page, task["competitor_url"])
+        ids, reason = fetch_similar_nm_ids(page, task["competitor_url"], nm_id)
 
     if ids is None:
         if reason == "404":
