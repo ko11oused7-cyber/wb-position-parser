@@ -2,7 +2,6 @@ name: WB Position Parser
 
 on:
   schedule:
-    # 04:00 UTC = 07:00 MSK. GitHub может стартовать крон с задержкой 5–15 мин.
     - cron: '0 4 * * *'
   workflow_dispatch: {}
 
@@ -38,3 +37,12 @@ jobs:
           SHEET_ID: ${{ vars.SHEET_ID }}
           TZ: Europe/Moscow
         run: python parser.py
+
+      - name: Upload failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-failures
+          path: failures/
+          if-no-files-found: ignore
+          retention-days: 7
