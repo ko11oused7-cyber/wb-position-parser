@@ -2,13 +2,14 @@ name: WB Position Parser
 
 on:
   schedule:
-    - cron: '0 4 * * *'
+    # 05:50 UTC = 08:50 MSK. GitHub может стартовать крон с задержкой 5–15 мин.
+    - cron: '50 5 * * *'
   workflow_dispatch: {}
 
 jobs:
   parse:
-    runs-on: ubuntu-latest
-    timeout-minutes: 355
+    runs-on: self-hosted
+    timeout-minutes: 180
     concurrency:
       group: wb-position-parser
       cancel-in-progress: false
@@ -28,8 +29,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Install Chromium for Playwright
-        run: |
-          python -m playwright install --with-deps chromium
+        run: python -m playwright install chromium
 
       - name: Run parser
         env:
